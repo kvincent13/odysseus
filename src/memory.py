@@ -108,7 +108,7 @@ class MemoryManager:
             the message matches the memory command pattern
         """
         # Pattern for memory commands: "remember: X", "memorize: X", "save: X", etc.
-        pattern = r'^(?:remember|memorize|save|note|store)[:\-]?\s+(.+)$'
+        pattern = r'^(?:remember|memorize|save|store)[:\-]?\s+(.+)$'
         match = re.match(pattern, message.strip(), re.IGNORECASE)
         
         if match:

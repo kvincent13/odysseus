@@ -23,6 +23,7 @@ from src.llm_core import (
     stream_llm_with_fallback,
 )
 from src.agent_loop import stream_agent_loop
+from src.fast_commands import route_fast_command
 from src import agent_runs
 from src.model_context import estimate_tokens
 from src.context_compactor import (
@@ -812,12 +813,20 @@ def setup_chat_routes(
         tool_policy = build_effective_tool_policy(last_user_message=message)
         allow_tool_preprocessing = not tool_policy.block_all_tool_calls
 
-        # Inline memory command
-        memory_response = None
-        if not tool_policy.blocks("manage_memory"):
-            memory_response = await chat_handler.handle_memory_command(sess, message)
-        if memory_response:
-            return {"response": memory_response}
+        # Deterministic Chief-of-Staff fast commands.
+        fast_result = await route_fast_command(
+            chat_handler=chat_handler,
+            session=sess,
+            message=message,
+            owner=owner,
+            tool_policy=tool_policy,
+            incognito=False,
+            no_memory=False,
+            approval_continuation=False,
+        )
+
+        if fast_result:
+            return {"response": fast_result.response}
 
         foreground_policy = resolve_foreground_model_policy(
             owner=owner,
@@ -1348,6 +1357,45 @@ def setup_chat_routes(
             last_user_message=message,
         )
         allow_tool_preprocessing = not pre_context_tool_policy.block_all_tool_calls
+
+        # -------------------------------------------------------------- #
+        # Deterministic Chief-of-Staff fast-command router.
+        #
+        # Explicit low-ambiguity commands are executed before context
+        # building or model inference. Anything unmatched falls through
+        # to the normal agent pipeline.
+        # -------------------------------------------------------------- #
+        fast_result = await route_fast_command(
+            chat_handler=chat_handler,
+            session=sess,
+            message=message,
+            owner=owner,
+            tool_policy=pre_context_tool_policy,
+            incognito=incognito,
+            no_memory=no_memory,
+            approval_continuation=tool_approval_continuation,
+        )
+
+        if fast_result:
+            logger.info(
+                "[fast-command] HIT type=%s session=%s",
+                fast_result.command_type,
+                session,
+            )
+
+            async def _fast_command_stream():
+                yield f'data: {json.dumps({"delta": fast_result.response})}\n\n'
+                yield 'data: [DONE]\n\n'
+
+            return StreamingResponse(
+                _fast_command_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                },
+            )
+
         foreground_policy = resolve_foreground_model_policy(
             owner=owner,
             allowed_models=_allowed_models_for_request(request),

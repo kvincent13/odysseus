@@ -49,6 +49,7 @@ DEFAULT_SETTINGS = {
     "image_quality": "medium",
     "vision_model": "",
     "vision_enabled": True,
+    "vision_context_length": 8192,
     # Ordered fallback chain for the Vision model (image analysis, OCR, tagging).
     "vision_model_fallbacks": [],
     # Public base URL used to build clickable deep-links in outgoing alerts

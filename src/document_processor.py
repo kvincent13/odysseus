@@ -355,7 +355,22 @@ def analyze_image_with_vl_result(image_path: str, owner: str | None = None) -> d
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Describe this image in detail"},
+                    {"type": "text", "text": """Analyze this image as visual evidence for another AI agent.
+
+Prioritize:
+- Exact visible text, especially errors, warnings, names, values, dates, statuses, and identifiers.
+- The application, page, dialog, or interface shown when identifiable.
+- Selected settings, toggles, fields, workflow steps, and configuration state.
+- Relationships between visible elements relevant to troubleshooting or the user's likely task.
+- Technical errors and troubleshooting evidence.
+- Differences between multiple screenshots if more than one is visible.
+
+Transcribe important text as accurately as possible.
+Clearly distinguish directly visible information from interpretation or inference.
+If text is too small or unclear, explicitly say so rather than guessing.
+Ignore decorative or irrelevant visual details.
+
+Return a concise, information-dense description for the primary reasoning agent."""},
                     {"type": "image_url", "image_url": {"url": f"data:image/{img_format};base64,{img_data}"}},
                 ],
             }
@@ -372,7 +387,14 @@ def analyze_image_with_vl_result(image_path: str, owner: str | None = None) -> d
         last_err = None
         for i, (_url, _model, _headers) in enumerate([c for c in _vl_candidates if c and c[0] and c[1]]):
             try:
-                description = llm_call(_url, _model, vl_messages, headers=_headers, timeout=120)
+                description = llm_call(
+                    _url,
+                    _model,
+                    vl_messages,
+                    headers=_headers,
+                    timeout=120,
+                    num_ctx=int(settings.get("vision_context_length", 8192)),
+                )
                 logger.info("VL analysis complete with model %s", _model)
                 return {"text": description, "model": _model}
             except Exception as e:

@@ -327,26 +327,283 @@ class ChatHandler:
         if len(session.history) > MAX_CONTEXT_MESSAGES:
             session.history = session.history[-MAX_CONTEXT_MESSAGES:]
 
-    async def handle_memory_command(self, session, message: str) -> Optional[str]:
-        """Process inline memory commands. Returns response string or None."""
+    async def handle_memory_command(
+        self,
+        session,
+        message: str,
+        owner: str = None,
+    ) -> Optional[str]:
+        """Fast deterministic handler for explicit memory commands."""
+        import re
+
         is_memory_cmd, memory_text = self.memory_manager.process_inline_memory_command(
             message
         )
+
+        # The built-in parser turns:
+        #   "Remember that Project X..."
+        # into:
+        #   "that Project X..."
+        # Strip that leading filler word.
         if is_memory_cmd and memory_text:
-            mem = self.memory_manager.load()
-            if not self.memory_manager.find_duplicates(memory_text, mem):
-                new_entry = self.memory_manager.add_entry(memory_text)
-                mem.append(new_entry)
-                self.memory_manager.save(mem)
+            memory_text = re.sub(
+                r"^that\s+",
+                "",
+                memory_text.strip(),
+                flags=re.IGNORECASE,
+            ).strip()
+
+        # Fallback for explicit natural-language Remember commands.
+        if not is_memory_cmd:
+            match = re.match(
+                r"^\s*remember(?:\s+that)?\s*[:,-]?\s*(.+?)\s*$",
+                message,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+
+            if match:
+                memory_text = match.group(1).strip()
+                is_memory_cmd = bool(memory_text)
+
+        if not is_memory_cmd or not memory_text:
+            return None
+
+        # Duplicate checking must use the same owner scope as /memory list.
+        visible_memories = self.memory_manager.load(owner=owner)
+
+        duplicate = self.memory_manager.find_duplicates(
+            memory_text,
+            visible_memories,
+        )
+
+        if duplicate:
+            response = "Yep - already remembered."
+
+        else:
+            # Create an owner-scoped memory entry.
+            new_entry = self.memory_manager.add_entry(
+                memory_text,
+                source="user",
+                category="fact",
+                owner=owner,
+            )
+
+            # Strict read-modify-write.
+            memories = self.memory_manager.load_all_for_update()
+            memories.append(new_entry)
+            self.memory_manager.save(memories)
+
+            # Keep vector search synchronized if available.
+            memory_vector = getattr(self, "memory_vector", None)
+
+            if memory_vector and getattr(memory_vector, "healthy", False):
+                try:
+                    memory_vector.add(
+                        new_entry["id"],
+                        memory_text,
+                    )
+                except Exception:
+                    pass
+
+            response = "Yep - remembered."
+
+        session.add_message(
+            ChatMessage("user", message)
+        )
+        session.add_message(
+            ChatMessage("assistant", response)
+        )
+
+        from src.database import update_session_last_accessed
+
+        update_session_last_accessed(session.id)
+        self.session_manager.save_sessions()
+
+        return response
+
+    async def handle_note_command(
+        self,
+        session,
+        message: str,
+        owner: str = None,
+    ) -> Optional[str]:
+        """Fast deterministic handler for Notes, Todos, and Reminders."""
+        import json
+        import re
+        from src.tools.notes import do_manage_notes
+
+        async def _save_note(args, success_response):
+            args["action"] = "add"
+            args["session_id"] = session.id
+
+            result = await do_manage_notes(
+                json.dumps(args),
+                owner=owner,
+            )
+
+            if result.get("error") or result.get("exit_code", 0) != 0:
+                error = result.get("error") or "Unknown notes error"
+                return f"Couldn't save that: {error}"
 
             session.add_message(ChatMessage("user", message))
-            session.add_message(
-                ChatMessage("assistant", f"Saved to memory: {memory_text}")
-            )
+            session.add_message(ChatMessage("assistant", success_response))
 
             from src.database import update_session_last_accessed
 
             update_session_last_accessed(session.id)
             self.session_manager.save_sessions()
-            return f"Saved to memory: {memory_text}"
-        return None
+
+            return success_response
+
+        # ----------------------------------------------------------
+        # REMINDER
+        #
+        # Supported:
+        #   Remind me tomorrow at 9 AM to call Tanner.
+        #   Remind me in 2 hours to check the backups.
+        #   Remind me at 3 PM to call Dorian.
+        #   Remind me to call Tanner tomorrow at 9 AM.
+        # ----------------------------------------------------------
+
+        if re.match(r"^\s*remind\s+me\b", message, re.IGNORECASE):
+            body = re.sub(
+                r"^\s*remind\s+me\s+",
+                "",
+                message,
+                count=1,
+                flags=re.IGNORECASE,
+            ).strip()
+
+            # Form 1:
+            # tomorrow at 9 AM to call Tanner
+            # in 2 hours to check backups
+            # at 3 PM to call Dorian
+            m = re.match(
+                r"^(?P<when>"
+                r"(?:today|tonight|tomorrow|tmrw)"
+                r"(?:\s+at)?\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?"
+                r"|in\s+\d+\s*(?:hours?|hrs?|minutes?|mins?|days?)"
+                r"|at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?"
+                r")\s+to\s+(?P<what>.+?)\s*$",
+                body,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+
+            if m:
+                when = m.group("when").strip()
+                what = m.group("what").strip()
+
+                # parse_due_for_user accepts bare times, not "at 3 PM".
+                when = re.sub(
+                    r"^at\s+",
+                    "",
+                    when,
+                    flags=re.IGNORECASE,
+                )
+
+                return await _save_note(
+                    {
+                        "title": what,
+                        "note_type": "note",
+                        "due_date": when,
+                        "label": "reminder",
+                    },
+                    "Reminder set.",
+                )
+
+            # Form 2:
+            # to call Tanner tomorrow at 9 AM
+            # to check backups in 2 hours
+            m = re.match(
+                r"^to\s+(?P<what>.+?)\s+"
+                r"(?P<when>"
+                r"(?:today|tonight|tomorrow|tmrw)"
+                r"(?:\s+at)?\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?"
+                r"|in\s+\d+\s*(?:hours?|hrs?|minutes?|mins?|days?)"
+                r"|at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?"
+                r")\s*$",
+                body,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+
+            if m:
+                what = m.group("what").strip()
+                when = m.group("when").strip()
+
+                when = re.sub(
+                    r"^at\s+",
+                    "",
+                    when,
+                    flags=re.IGNORECASE,
+                )
+
+                return await _save_note(
+                    {
+                        "title": what,
+                        "note_type": "note",
+                        "due_date": when,
+                        "label": "reminder",
+                    },
+                    "Reminder set.",
+                )
+
+            # Explicit reminder, but we couldn't safely determine the time.
+            # Fall through to Qwen rather than creating a bad reminder.
+            return None
+
+        # ----------------------------------------------------------
+        # TODO
+        # ----------------------------------------------------------
+
+        todo_match = re.match(
+            r"^\s*(?:add\s+(?:a\s+)?todo(?:\s+to)?|todo)\s*[:,-]?\s*(.+?)\s*$",
+            message,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        if todo_match:
+            todo_text = todo_match.group(1).strip()
+
+            if not todo_text:
+                return None
+
+            return await _save_note(
+                {
+                    "title": todo_text,
+                    "note_type": "checklist",
+                    "checklist_items": [
+                        {
+                            "text": todo_text,
+                            "done": False,
+                        }
+                    ],
+                    "label": "todo",
+                },
+                "Added.",
+            )
+
+        # ----------------------------------------------------------
+        # NOTE
+        # ----------------------------------------------------------
+
+        note_match = re.match(
+            r"^\s*note(?:\s+that|\s+this)?\s*[:,-]?\s*(.+?)\s*$",
+            message,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        if not note_match:
+            return None
+
+        note_text = note_match.group(1).strip()
+
+        if not note_text:
+            return None
+
+        return await _save_note(
+            {
+                "title": note_text,
+                "note_type": "note",
+            },
+            "Noted.",
+        )

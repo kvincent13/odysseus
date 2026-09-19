@@ -55,8 +55,8 @@ def test_vision_analysis_uses_owner_scoped_primary_and_fallback(monkeypatch, tmp
         seen["fallback_owner"] = owner
         return []
 
-    def fake_llm_call(url, model, messages, headers=None, timeout=None):
-        seen["llm"] = (url, model, headers, timeout, messages)
+    def fake_llm_call(url, model, messages, headers=None, timeout=None, num_ctx=None):
+        seen["llm"] = (url, model, headers, timeout, num_ctx, messages)
         return "description"
 
     monkeypatch.setattr(dp, "_load_vl_settings", lambda: {"vision_enabled": True, "vision_model": "gpt-4o"})
@@ -76,11 +76,12 @@ def test_vision_analysis_uses_owner_scoped_primary_and_fallback(monkeypatch, tmp
     }
     assert seen["primary"] == ("gpt-4o", "alice")
     assert seen["fallback_owner"] == "alice"
-    assert seen["llm"][:4] == (
+    assert seen["llm"][:5] == (
         "http://primary.test/chat/completions",
         "vision-primary",
         {"X-Test": "1"},
         120,
+        8192,
     )
 
 

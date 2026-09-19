@@ -1385,6 +1385,89 @@ def _assistant_requested_followup(messages: List[Dict]) -> bool:
     return False
 
 
+def _raw_user_instruction(text: str) -> str:
+    """Return only the user's authored instruction for routing/authority checks.
+
+    Attachment preprocessing can append vision/OCR/document evidence to the
+    user message. That evidence is context for reasoning, never authorization
+    to invoke tools or take external action.
+    """
+    t = text or ""
+
+    enrichment_markers = (
+        "\n\n[Image:",
+        "\n\n[Image attached:",
+        "\n\n[User-corrected caption",
+        "\n\n[No vision model configured",
+        "\n\n[VL model unavailable",
+    )
+
+    cut = len(t)
+    for marker in enrichment_markers:
+        pos = t.find(marker)
+        if pos >= 0:
+            cut = min(cut, pos)
+
+    return t[:cut].strip()
+
+
+def _is_direct_reasoning_request(text: str) -> bool:
+    """True when the user wants explanation/analysis, not external action.
+
+    This lets Agent mode answer ordinary reasoning questions directly instead
+    of loading tool schemas simply because the subject mentions email, tasks,
+    settings, files, etc.
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+
+    # Advisory questions can mention action verbs without authorizing action.
+    # "Should I pay/send/delete/restart...?" asks for judgment, not execution.
+    advisory_patterns = (
+        r"\bshould i\b",
+        r"\bshould we\b",
+        r"\bwould you recommend\b",
+        r"\bdo you recommend\b",
+        r"\bwhy should(?:n'?t)? i\b",
+        r"\bwhy should(?:n'?t)? we\b",
+        r"\bis it (?:a )?good idea to\b",
+        r"\bwhat(?:'s| is) the best way to\b",
+        r"\bhow should i\b",
+        r"\bhow should we\b",
+    )
+
+    if any(re.search(pattern, t, re.IGNORECASE) for pattern in advisory_patterns):
+        return True
+
+    # Explicit external/action intent must stay in the agent/tool path.
+    action_patterns = (
+        r"\b(send|reply|email|delete|remove|archive|mark|create|add|update|change|"
+        r"modify|edit|install|download|upload|run|execute|open|close|move|copy|"
+        r"rename|schedule|book|pay|purchase|order|enable|disable|turn on|"
+        r"turn off|switch|deploy|restart|stop|start)\b",
+        r"\b(go ahead|do it|make the change|apply (?:it|that|this)|fix it for me)\b",
+        r"\b(create|generate|issue|send|prepare|make|build)\b.{0,30}\binvoice\b",
+        r"\binvoice\b.{0,30}\b(create|generate|issue|send|prepare|make|build)\b",
+        r"\b(search|browse|look up|lookup|research|google|find online|check online)\b",
+        r"\b(latest|current|today|right now|up to date|up-to-date)\b",
+    )
+
+    if any(re.search(pattern, t, re.IGNORECASE) for pattern in action_patterns):
+        return False
+
+    # Questions asking Cara to inspect, explain, reason, diagnose, compare, or
+    # guide the user can normally be answered without external side effects.
+    reasoning_patterns = (
+        r"\b(what|why|how|explain|describe|analy[sz]e|review|compare|summari[sz]e|"
+        r"interpret|diagnose|troubleshoot|figure out|what'?s wrong|what is wrong|"
+        r"what does|what do you think|help me understand|walk me through)\b",
+        r"\b(look closely|look at (?:this|these|the)|based on (?:this|these|the))\b",
+    )
+
+    return any(re.search(pattern, t, re.IGNORECASE) for pattern in reasoning_patterns)
+
+
 def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, object]:
     """Classify only whether this turn deserves domain tool retrieval.
 
@@ -1927,6 +2010,109 @@ def _minimal_odysseus_general_messages(messages: List[Dict], include_memory: boo
     if tool_context_message:
         out.append(tool_context_message)
     out.append({"role": "user", "content": latest})
+    return out
+
+
+def _minimal_stock_qwen_chat_messages(
+    messages: List[Dict],
+    *,
+    crew_name: str = "",
+    crew_personality: str = "",
+    include_memory: bool = True,
+    recent_messages: int = 4,
+) -> List[Dict]:
+    """Small contextual chat prompt for stock/local Qwen models.
+
+    This is intentionally NOT the Odysseus fine-tune prompt. It preserves the
+    interactive Crew persona, a tiny amount of saved memory, and a short recent
+    conversation window without injecting the full agent/tool operating manual.
+    """
+
+    name = (crew_name or "Odysseus").strip()
+
+    system_parts = [
+        f"You are {name}.",
+        "You are Kyle's Chief of Staff: his trusted lieutenant, business operator, and technical strategist.",
+        "Be direct, concise, practical, decisive, and conversational.",
+        "Match Kyle's casual tone; profanity is fine when it fits naturally.",
+        "Give the answer first. Do not over-explain unless asked.",
+        "Maintain continuity with the recent conversation and relevant saved facts.",
+        "Do not claim to have used tools or taken actions unless tool execution actually occurred.",
+    ]
+
+    # IMPORTANT:
+    # Do NOT inject the full Crew personality into fast chat.
+    # The full Chief-of-Staff doctrine is intentionally reserved for the
+    # normal Agent/Deep path. Fast chat uses this compact operating persona.
+
+    out = [{
+        "role": "system",
+        "content": "\n\n".join(system_parts),
+        "_agent_injected": "prompt",
+    }]
+
+    if include_memory:
+        memory_message = _minimal_saved_memory_message(messages)
+        if memory_message:
+            memory_message["_agent_injected"] = "context"
+            out.append(memory_message)
+
+    # Keep only actual conversational user/assistant turns.
+    conversational = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+
+        role = message.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+
+        # Exclude injected context and tool-bearing assistant messages.
+        if message.get("_agent_injected"):
+            continue
+        if message.get("tool_calls"):
+            continue
+
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+
+        content = content.strip()
+
+        # Fast chat needs continuity, not entire essays from previous turns.
+        if len(content) > 1200:
+            content = content[:1200].rstrip() + " ..."
+
+        conversational.append({
+            "role": role,
+            "content": content,
+        })
+
+    # The current user message is already the final conversational message.
+    # Keep a tiny recent window while guaranteeing that latest message survives.
+    conversational = conversational[-max(int(recent_messages), 1):]
+
+    out.extend(conversational)
+
+    logger.warning(
+        "[fast-chat-size] messages=%s total_chars=%s breakdown=%s",
+        len(out),
+        sum(len(str(m.get("content") or "")) for m in out),
+        [
+            (
+                m.get("role"),
+                len(str(m.get("content") or "")),
+                m.get("_agent_injected"),
+            )
+            for m in out
+        ],
+    )
+
+    # Defensive fallback.
+    latest = _extract_last_user_message(messages)
+    if not any(m.get("role") == "user" for m in out[1:]) and latest:
+        out.append({"role": "user", "content": latest})
+
     return out
 
 
@@ -3415,6 +3601,74 @@ def _detect_runaway_call(call_freq, threshold=15):
     return sig.split(":", 1)[0] if sig else None
 
 
+
+def _resolve_active_crew_persona(session_id: Optional[str], owner: Optional[str]):
+    """Resolve the persona for an interactive agent request.
+
+    Priority:
+      1. CrewMember explicitly linked to this session (specialist agent)
+      2. Owner's default personal assistant / Chief of Staff
+      3. None
+
+    Returns (name, personality) or (None, None).
+    """
+    if not session_id and not owner:
+        return None, None
+
+    try:
+        from core.database import SessionLocal, Session as DbSession, CrewMember
+
+        db = SessionLocal()
+        try:
+            # A directly-linked CrewMember always wins.
+            if session_id:
+                sess = db.query(DbSession).filter(
+                    DbSession.id == session_id
+                ).first()
+
+                if sess and getattr(sess, "crew_member_id", None):
+                    q = db.query(CrewMember).filter(
+                        CrewMember.id == sess.crew_member_id
+                    )
+
+                    if owner:
+                        q = q.filter(CrewMember.owner == owner)
+
+                    crew = q.first()
+
+                    if crew and (crew.personality or "").strip():
+                        return (
+                            (crew.name or "Crew Member").strip(),
+                            crew.personality.strip(),
+                        )
+
+            # Ordinary chats fall back to the owner's default assistant.
+            if owner:
+                crew = db.query(CrewMember).filter(
+                    CrewMember.owner == owner,
+                    CrewMember.is_default_assistant == True,  # noqa: E712
+                ).order_by(CrewMember.created_at.asc()).first()
+
+                if crew and (crew.personality or "").strip():
+                    return (
+                        (crew.name or "Chief of Staff").strip(),
+                        crew.personality.strip(),
+                    )
+
+        finally:
+            db.close()
+
+    except Exception as exc:
+        logger.warning(
+            "Failed to resolve interactive Crew persona for session=%s owner=%s: %s",
+            session_id,
+            owner,
+            exc,
+        )
+
+    return None, None
+
+
 async def stream_agent_loop(
     endpoint_url: str,
     model: str,
@@ -3460,6 +3714,13 @@ async def stream_agent_loop(
       - data: {"type": "metrics", "data": {...}}            (final metrics)
       - data: [DONE]                                        (end)
     """
+
+    # Interactive Crew routing:
+    # specialist CrewMember for this session > default Chief of Staff.
+    _active_crew_name, _active_crew_personality = _resolve_active_crew_persona(
+        session_id,
+        owner,
+    )
 
     run_security = ToolRunSecurityContext(
         external_untrusted_context_seen=(
@@ -3527,7 +3788,9 @@ async def stream_agent_loop(
     if _ody_qwen_finetune_model:
         temperature = _ody_qwen_temperature_cap(temperature)
     _ody_memory_identity_turn = _looks_like_memory_identity_turn(_last_user)
-    _intent = _classify_agent_request(messages, _last_user)
+    _raw_instruction = _raw_user_instruction(_last_user)
+    _intent = _classify_agent_request(messages, _raw_instruction)
+    _direct_reasoning_turn = _is_direct_reasoning_request(_raw_instruction)
     _low_signal_turn = bool(_intent.get("low_signal"))
     _casual_low_signal_turn = _is_casual_low_signal(_last_user)
     _existing_conversation = _user_turn_count(messages) > 1
@@ -3539,9 +3802,26 @@ async def stream_agent_loop(
             "mcp__email__list_emails", "mcp__email__read_email", "mcp__email__scan_email_unsubscribes",
         })
     _prompt_active_document = active_document if _active_document_relevant else None
+    # A normal chat request can arrive with web_search/web_fetch forced by
+    # request/UI state even when the user's actual intent is ordinary
+    # conversation. Do not let those passive web defaults kick a clearly
+    # low-signal, non-web turn into the full agent pipeline.
+    _forced_tool_set = set(forced_tools or [])
+    _intent_domains_for_fast_chat = set(_intent.get("domains") or set())
+
+    _passive_web_force_only = (
+        bool(_forced_tool_set)
+        and _forced_tool_set.issubset({"web_search", "web_fetch"})
+        and "web" not in _intent_domains_for_fast_chat
+    )
+
+    _fast_chat_forced_tools_clear = (
+        not _forced_tool_set
+        or _passive_web_force_only
+    )
+
     _direct_low_signal = (
-        _low_signal_turn
-        and not _existing_conversation
+        (_low_signal_turn or _direct_reasoning_turn)
         and not bool(_intent.get("continuation"))
         and not plan_mode
         and not approved_plan
@@ -3549,8 +3829,30 @@ async def stream_agent_loop(
         and (_casual_low_signal_turn or not _active_document_relevant)
         and (_casual_low_signal_turn or not active_email)
         and (_casual_low_signal_turn or not workspace)
-        and not forced_tools
+        and _fast_chat_forced_tools_clear
         and not relevant_tools
+    )
+
+    logger.warning(
+        "[fast-chat-gate] low=%r direct_reasoning=%r continuation=%r plan=%r approved=%r guide=%r "
+        "casual=%r active_doc=%r active_email=%r workspace=%r "
+        "forced_tools=%r passive_web_only=%r domains=%r "
+        "relevant_tools=%r RESULT=%r",
+        _low_signal_turn,
+        _direct_reasoning_turn,
+        bool(_intent.get("continuation")),
+        plan_mode,
+        bool(approved_plan),
+        guide_only,
+        _casual_low_signal_turn,
+        _active_document_relevant,
+        bool(active_email),
+        bool(workspace),
+        sorted(_forced_tool_set),
+        _passive_web_force_only,
+        sorted(_intent_domains_for_fast_chat),
+        sorted(relevant_tools or []),
+        _direct_low_signal,
     )
     # Tool retrieval uses the latest message by default. It may inherit recent
     # user turns only for explicit continuations ("yes", "do it", "1").
@@ -3598,7 +3900,13 @@ async def stream_agent_loop(
                 include_memory=True,
             )
             if _ody_qwen_finetune_model
-            else [{"role": "user", "content": _last_user}]
+            else _minimal_stock_qwen_chat_messages(
+                messages,
+                crew_name=_active_crew_name,
+                crew_personality=_active_crew_personality,
+                include_memory=True,
+                recent_messages=4,
+            )
         )
         direct_response = ""
         direct_start = time.time()
@@ -3618,7 +3926,13 @@ async def stream_agent_loop(
             candidate_messages = (
                 _minimal_odysseus_general_messages(messages, include_memory=True)
                 if candidate_is_qwen
-                else [{"role": "user", "content": _last_user}]
+                else _minimal_stock_qwen_chat_messages(
+                    messages,
+                    crew_name=_active_crew_name,
+                    crew_personality=_active_crew_personality,
+                    include_memory=True,
+                    recent_messages=4,
+                )
             )
             direct_candidate_messages[_index] = candidate_messages
             return {
@@ -3689,7 +4003,7 @@ async def stream_agent_loop(
         try:
             async for chunk in stream_llm_with_fallback(
                 [(endpoint_url, model, headers)] + list(fallbacks or []),
-                direct_messages,
+                messages,
                 temperature=temperature,
                 max_tokens=min(max_tokens or 128, 128),
                 prompt_type=None,
@@ -4316,6 +4630,33 @@ async def stream_agent_loop(
             active_email=active_email,
             workspace=workspace,
         )
+        # Apply the interactive Crew persona after the shared/cached Odysseus
+        # system prompt has been constructed. This keeps Crew identity
+        # request-specific and prevents persona bleed between sessions.
+        if _active_crew_personality:
+            _persona_block = (
+                "\n\n## ACTIVE CREW PERSONA\n"
+                f"You are {_active_crew_name}. The following is your persistent "
+                "identity, operating doctrine, communication style, and authority "
+                "for this conversation. Follow it unless it conflicts with higher-"
+                "priority Odysseus safety/security instructions.\n\n"
+                + _active_crew_personality
+            )
+
+            _persona_applied = False
+            for _msg in route_messages:
+                if _msg.get("_agent_injected") in {"prompt", "merged_prompt"}:
+                    _msg["content"] = (_msg.get("content") or "") + _persona_block
+                    _persona_applied = True
+                    break
+
+            if not _persona_applied:
+                route_messages.insert(0, {
+                    "role": "system",
+                    "content": _persona_block.strip(),
+                    "_agent_injected": "prompt",
+                })
+
         if doc_mode and not plan_mode and not approved_plan and not guide_only:
             route_messages = _minimal_odysseus_doc_messages(
                 route_messages,
