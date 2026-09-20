@@ -9,6 +9,7 @@ from src.chat_helpers import extract_urls
 from src.youtube_handler import is_youtube_url
 from src.search import comprehensive_web_search, fetch_webpage_content
 from src.prompt_security import UNTRUSTED_CONTEXT_POLICY, untrusted_context_message
+from src.cara_identity import CARA_IDENTITY_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -295,6 +296,14 @@ class ChatProcessor:
         """
         preface = []
         rag_sources = []
+
+        # Cara's canonical identity is trusted, static system context.
+        # It is independent of Chat/Agent mode, presets, memory, RAG,
+        # attachments, and the underlying model provider.
+        preface.append({
+            "role": "system",
+            "content": CARA_IDENTITY_PROMPT,
+        })
 
         # Add preset system prompt if specified
         if preset_system_prompt:

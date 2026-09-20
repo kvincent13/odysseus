@@ -54,6 +54,7 @@ from src.tool_approvals import (
     tool_approval_store,
 )
 from src.tool_utils import _truncate, get_mcp_manager
+from src.cara_identity import CARA_IDENTITY_PROMPT
 from src.agent_tools import (
     parse_tool_blocks,
     strip_tool_blocks,
@@ -2028,16 +2029,8 @@ def _minimal_stock_qwen_chat_messages(
     conversation window without injecting the full agent/tool operating manual.
     """
 
-    name = (crew_name or "Odysseus").strip()
-
     system_parts = [
-        f"You are {name}.",
-        "You are Kyle's Chief of Staff: his trusted lieutenant, business operator, and technical strategist.",
-        "Be direct, concise, practical, decisive, and conversational.",
-        "Match Kyle's casual tone; profanity is fine when it fits naturally.",
-        "Give the answer first. Do not over-explain unless asked.",
-        "Maintain continuity with the recent conversation and relevant saved facts.",
-        "Do not claim to have used tools or taken actions unless tool execution actually occurred.",
+        CARA_IDENTITY_PROMPT,
     ]
 
     # IMPORTANT:
