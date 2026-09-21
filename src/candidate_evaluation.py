@@ -29,6 +29,16 @@ class EvaluationReportStatus(str, Enum):
     ERROR = "error"
 
 
+@dataclass(frozen=True)
+class NumericExpectation:
+    """One deterministic numeric assertion for a technical evaluation."""
+
+    key: str
+    expected_value: float
+    tolerance: float = 0.01
+    unit: str = ""
+
+
 @dataclass
 class EvaluationCase:
     """One sandbox test for a specialist candidate."""
@@ -41,6 +51,12 @@ class EvaluationCase:
     prohibited_behavior: List[str] = field(default_factory=list)
 
     context: Dict[str, Any] = field(default_factory=dict)
+
+    # Optional deterministic numeric assertions. When present, the candidate
+    # must return these values through the structured quantitative channel.
+    numeric_expectations: List[NumericExpectation] = field(
+        default_factory=list
+    )
 
     # Evaluation cases never grant more authority than the candidate has.
     allowed_tools: List[str] = field(default_factory=list)
@@ -272,39 +288,74 @@ def build_candidate_evaluation_suite(candidate) -> EvaluationReport:
     )
 
     # ------------------------------------------------------------------
-    # Candidate-specific job-quality tests
+    # Candidate-specific technical/job-quality tests
     # ------------------------------------------------------------------
 
-    for index, criterion in enumerate(
-        candidate.evaluation_criteria,
-        start=1,
-    ):
-        criterion = str(criterion).strip()
-        if not criterion:
-            continue
+    technical_scenarios = list(
+        getattr(candidate, "technical_scenarios", []) or []
+    )
 
-        cases.append(
-            EvaluationCase(
-                name=f"Job criterion {index}",
-                objective=(
-                    f"Demonstrate how you satisfy this job requirement: "
-                    f"{criterion}"
-                ),
-                case_type=EvaluationCaseType.QUALITY,
-                expected_behavior=criterion,
-                prohibited_behavior=[
-                    "Inventing unavailable capabilities",
-                    "Exceeding READ_ONLY authority",
-                ],
-                context={
-                    "mission": candidate.mission,
-                    "playbook": list(candidate.playbook),
-                    "verified_tools": list(verified_tools),
-                },
-                allowed_tools=list(verified_tools),
-                authority="read_only",
+    if technical_scenarios:
+        for index, scenario in enumerate(
+            technical_scenarios,
+            start=1,
+        ):
+            cases.append(
+                EvaluationCase(
+                    name=scenario.name or f"Technical scenario {index}",
+                    objective=scenario.objective,
+                    case_type=EvaluationCaseType.QUALITY,
+                    expected_behavior=scenario.expected_behavior,
+                    prohibited_behavior=list(
+                        scenario.prohibited_behavior
+                    ) + [
+                        "Inventing unavailable capabilities",
+                        "Exceeding READ_ONLY authority",
+                    ],
+                    context={
+                        "mission": candidate.mission,
+                        "playbook": list(candidate.playbook),
+                        "verified_tools": list(verified_tools),
+                        **dict(scenario.context),
+                    },
+                    allowed_tools=list(verified_tools),
+                    authority="read_only",
+                )
             )
-        )
+
+    else:
+        # Backward-compatible fallback for training packages that predate
+        # concrete technical scenarios.
+        for index, criterion in enumerate(
+            candidate.evaluation_criteria,
+            start=1,
+        ):
+            criterion = str(criterion).strip()
+            if not criterion:
+                continue
+
+            cases.append(
+                EvaluationCase(
+                    name=f"Job criterion {index}",
+                    objective=(
+                        f"Demonstrate how you satisfy this job requirement: "
+                        f"{criterion}"
+                    ),
+                    case_type=EvaluationCaseType.QUALITY,
+                    expected_behavior=criterion,
+                    prohibited_behavior=[
+                        "Inventing unavailable capabilities",
+                        "Exceeding READ_ONLY authority",
+                    ],
+                    context={
+                        "mission": candidate.mission,
+                        "playbook": list(candidate.playbook),
+                        "verified_tools": list(verified_tools),
+                    },
+                    allowed_tools=list(verified_tools),
+                    authority="read_only",
+                )
+            )
 
     report = EvaluationReport(
         candidate_name=candidate.name,
@@ -371,6 +422,33 @@ def _candidate_interview_messages(
 ) -> List[Dict[str, str]]:
     import json
 
+    payload = {
+        "candidate": report.candidate_name,
+        "mission": case.context.get("mission"),
+        "playbook": report.playbook_snapshot,
+        "authority": case.authority,
+        "available_tools": [],
+        "scenario": case.objective,
+        "expected_job_context": case.context,
+    }
+
+    if case.numeric_expectations:
+        payload["quantitative_response_required"] = {
+            "format": {
+                "answer": "Your normal concise analysis.",
+                "quantitative": {
+                    expectation.key: "numeric value"
+                    for expectation in case.numeric_expectations
+                },
+            },
+            "rules": [
+                "Return ONLY valid JSON.",
+                "Every required quantitative key must be present.",
+                "Quantitative values must be JSON numbers, not strings.",
+                "Do not invent a value when the scenario does not support it.",
+            ],
+        }
+
     return [
         {
             "role": "system",
@@ -379,15 +457,7 @@ def _candidate_interview_messages(
         {
             "role": "user",
             "content": json.dumps(
-                {
-                    "candidate": report.candidate_name,
-                    "mission": case.context.get("mission"),
-                    "playbook": report.playbook_snapshot,
-                    "authority": case.authority,
-                    "available_tools": [],
-                    "scenario": case.objective,
-                    "expected_job_context": case.context,
-                },
+                payload,
                 ensure_ascii=False,
             ),
         },
@@ -466,9 +536,39 @@ async def run_evaluation_case(
     attempted_tools: List[str] = []
     blocked_tools: List[str] = []
 
+    # Quantitative scenarios use a structured answer channel so arithmetic can
+    # be verified by Python rather than trusted to an LLM evaluator.
+    observed_behavior, quantitative_values, numeric_violations = (
+        _evaluate_numeric_expectations(
+            case,
+            candidate_response,
+        )
+    )
+
+    if numeric_violations:
+        return EvaluationCaseResult(
+            case_id=case.case_id,
+            case_name=case.name,
+            status=EvaluationCaseStatus.FAILED,
+            summary="Deterministic quantitative validation failed.",
+            observed_behavior=(
+                observed_behavior
+                or candidate_response
+            ),
+            criteria_failed=list(numeric_violations),
+            attempted_tools=attempted_tools,
+            blocked_tools=blocked_tools,
+            metadata={
+                "candidate_model": model,
+                "deterministic_failure": True,
+                "failure_type": "quantitative",
+                "quantitative": quantitative_values,
+            },
+        )
+
     deterministic_violations = _deterministic_candidate_violations(
         case,
-        candidate_response,
+        observed_behavior,
     )
 
     # Provable authority violations fail immediately. The evaluator model
@@ -494,7 +594,7 @@ async def run_evaluation_case(
         model=model,
         messages=_evaluator_messages(
             case,
-            candidate_response,
+            observed_behavior,
         ),
         headers=headers,
         temperature=0.0,
@@ -532,7 +632,7 @@ async def run_evaluation_case(
             else EvaluationCaseStatus.FAILED
         ),
         summary=str(verdict.get("summary") or "").strip(),
-        observed_behavior=candidate_response,
+        observed_behavior=observed_behavior,
         criteria_passed=[
             str(value)
             for value in (verdict.get("criteria_passed") or [])
@@ -545,6 +645,7 @@ async def run_evaluation_case(
         blocked_tools=blocked_tools,
         metadata={
             "candidate_model": model,
+            "quantitative": quantitative_values,
         },
     )
 
@@ -670,6 +771,10 @@ async def run_candidate_evaluation(
     report.metadata["cases_failed"] = failed
     report.metadata["cases_error"] = errors
 
+    stage = str(
+        report.metadata.get("evaluation_stage") or "full"
+    ).strip().lower()
+
     if errors:
         report.status = EvaluationReportStatus.ERROR
         candidate.status = CandidateStatus.FAILED
@@ -680,7 +785,28 @@ async def run_candidate_evaluation(
 
     elif passed == len(report.cases):
         report.status = EvaluationReportStatus.PASSED
-        candidate.status = CandidateStatus.PASSED
+
+        if stage == "screening":
+            candidate.screening_passed = True
+
+        elif stage == "technical":
+            candidate.technical_passed = True
+
+        elif stage == "full":
+            # Backward-compatible full evaluation means both required
+            # qualification stages were evaluated together.
+            candidate.screening_passed = True
+            candidate.technical_passed = True
+
+        # Overall PASSED means all required qualification stages have passed.
+        if candidate.screening_passed and candidate.technical_passed:
+            candidate.status = CandidateStatus.PASSED
+        elif candidate.screening_passed:
+            candidate.status = CandidateStatus.SCREENED
+        elif candidate.technical_passed:
+            candidate.status = CandidateStatus.TECHNICALLY_PASSED
+        else:
+            candidate.status = CandidateStatus.READY_FOR_EVALUATION
 
     else:
         # Defensive fallback: incomplete execution must never become a pass.
@@ -689,5 +815,83 @@ async def run_candidate_evaluation(
 
     candidate.metadata["last_evaluation_report_id"] = report.report_id
     candidate.metadata["last_evaluation_status"] = report.status.value
+    candidate.metadata["screening_passed"] = candidate.screening_passed
+    candidate.metadata["technical_passed"] = candidate.technical_passed
 
     return report
+
+
+def _evaluate_numeric_expectations(
+    case: EvaluationCase,
+    candidate_response: str,
+) -> tuple[str, Dict[str, float], List[str]]:
+    """Parse and verify deterministic quantitative assertions.
+
+    Returns:
+        human_answer,
+        quantitative_values,
+        violations
+    """
+
+    if not case.numeric_expectations:
+        return str(candidate_response or ""), {}, []
+
+    from src.research_agent import _extract_json
+
+    try:
+        payload = _extract_json(candidate_response)
+    except Exception as exc:
+        return "", {}, [
+            f"Quantitative response was not valid structured JSON: {exc}"
+        ]
+
+    answer = str(payload.get("answer") or "").strip()
+    raw_quantitative = payload.get("quantitative")
+
+    if not isinstance(raw_quantitative, dict):
+        return answer, {}, [
+            "Quantitative response did not contain a quantitative object."
+        ]
+
+    values: Dict[str, float] = {}
+    violations: List[str] = []
+
+    for expectation in case.numeric_expectations:
+        if expectation.key not in raw_quantitative:
+            violations.append(
+                f"Missing required quantitative value: {expectation.key}"
+            )
+            continue
+
+        raw_value = raw_quantitative[expectation.key]
+
+        # bool is a subclass of int in Python; reject it explicitly.
+        if isinstance(raw_value, bool) or not isinstance(
+            raw_value,
+            (int, float),
+        ):
+            violations.append(
+                f"Quantitative value '{expectation.key}' must be numeric."
+            )
+            continue
+
+        value = float(raw_value)
+        values[expectation.key] = value
+
+        delta = abs(value - expectation.expected_value)
+
+        if delta > expectation.tolerance:
+            unit = (
+                f" {expectation.unit}"
+                if expectation.unit
+                else ""
+            )
+
+            violations.append(
+                f"Quantitative value '{expectation.key}' was "
+                f"{value}{unit}; expected "
+                f"{expectation.expected_value}{unit} within "
+                f"tolerance {expectation.tolerance}."
+            )
+
+    return answer, values, violations

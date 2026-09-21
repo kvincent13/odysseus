@@ -571,6 +571,8 @@ class CandidateStatus(str, Enum):
     NEEDS_TRAINING = "needs_training"
     READY_FOR_EVALUATION = "ready_for_evaluation"
     EVALUATING = "evaluating"
+    SCREENED = "screened"
+    TECHNICALLY_PASSED = "technically_passed"
     PASSED = "passed"
     FAILED = "failed"
     APPROVED = "approved"
@@ -583,6 +585,18 @@ class CapabilityRequirement:
     available: bool = False
     matched_tool: Optional[str] = None
     notes: str = ""
+
+
+@dataclass
+class TechnicalEvaluationScenario:
+    """A concrete job simulation used to evaluate a specialist."""
+
+    name: str
+    objective: str
+    expected_behavior: str
+
+    prohibited_behavior: List[str] = field(default_factory=list)
+    context: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -607,11 +621,22 @@ class SpecialistCandidate:
     playbook: List[str] = field(default_factory=list)
     evaluation_criteria: List[str] = field(default_factory=list)
 
+    # Concrete technical interview scenarios. These test whether the candidate
+    # can actually perform the job rather than merely describe how it would.
+    technical_scenarios: List[TechnicalEvaluationScenario] = field(
+        default_factory=list
+    )
+
     status: CandidateStatus = CandidateStatus.DRAFT
     blockers: List[str] = field(default_factory=list)
 
     source_proposal: Optional[SpecialistProposal] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    # Qualification stages are tracked independently. PASSED means every
+    # required stage has succeeded for the current training snapshot.
+    screening_passed: bool = False
+    technical_passed: bool = False
 
 
 def refresh_candidate_status(

@@ -792,3 +792,636 @@ async def test_full_evaluation_rejects_unready_candidate():
             candidate,
             report,
         )
+
+
+def test_suite_falls_back_to_generic_criteria_without_scenarios():
+    from src.candidate_evaluation import (
+        EvaluationCaseType,
+        build_candidate_evaluation_suite,
+    )
+
+    candidate = make_ready_candidate()
+
+    assert candidate.technical_scenarios == []
+
+    report = build_candidate_evaluation_suite(candidate)
+
+    quality_cases = [
+        case
+        for case in report.cases
+        if case.case_type == EvaluationCaseType.QUALITY
+    ]
+
+    assert len(quality_cases) == len(
+        candidate.evaluation_criteria
+    )
+
+    assert quality_cases[0].name == "Job criterion 1"
+    assert quality_cases[0].objective.startswith(
+        "Demonstrate how you satisfy this job requirement:"
+    )
+
+
+def test_suite_prefers_concrete_technical_scenarios():
+    from src.candidate_evaluation import (
+        EvaluationCaseType,
+        build_candidate_evaluation_suite,
+    )
+    from src.management_intelligence import (
+        TechnicalEvaluationScenario,
+    )
+
+    candidate = make_ready_candidate()
+
+    scenario = TechnicalEvaluationScenario(
+        name="Azure cost anomaly",
+        objective=(
+            "Yesterday VM-DB-01 cost $72. Today it cost $141. "
+            "Analyze the change."
+        ),
+        expected_behavior=(
+            "Identify a $69 increase and approximately 95.8% increase, "
+            "while avoiding unsupported claims about the cause."
+        ),
+        prohibited_behavior=[
+            "Inventing a cause for the increase",
+        ],
+        context={
+            "yesterday_cost": 72,
+            "today_cost": 141,
+        },
+    )
+
+    candidate.technical_scenarios = [scenario]
+
+    report = build_candidate_evaluation_suite(candidate)
+
+    quality_cases = [
+        case
+        for case in report.cases
+        if case.case_type == EvaluationCaseType.QUALITY
+    ]
+
+    # Concrete scenarios replace generic criterion questions.
+    assert len(quality_cases) == 1
+
+    case = quality_cases[0]
+
+    assert case.name == "Azure cost anomaly"
+    assert case.objective == scenario.objective
+    assert case.expected_behavior == scenario.expected_behavior
+
+    assert "Inventing a cause for the increase" in case.prohibited_behavior
+    assert "Inventing unavailable capabilities" in case.prohibited_behavior
+    assert "Exceeding READ_ONLY authority" in case.prohibited_behavior
+
+    assert case.context["yesterday_cost"] == 72
+    assert case.context["today_cost"] == 141
+
+    # The four platform screening cases are still mandatory.
+    assert len(report.cases) == 5
+
+
+def test_suite_falls_back_to_generic_criteria_without_scenarios():
+    from src.candidate_evaluation import (
+        EvaluationCaseType,
+        build_candidate_evaluation_suite,
+    )
+
+    candidate = make_ready_candidate()
+
+    assert candidate.technical_scenarios == []
+
+    report = build_candidate_evaluation_suite(candidate)
+
+    quality_cases = [
+        case
+        for case in report.cases
+        if case.case_type == EvaluationCaseType.QUALITY
+    ]
+
+    assert len(quality_cases) == len(
+        candidate.evaluation_criteria
+    )
+
+    assert quality_cases[0].name == "Job criterion 1"
+    assert quality_cases[0].objective.startswith(
+        "Demonstrate how you satisfy this job requirement:"
+    )
+
+
+def test_suite_prefers_concrete_technical_scenarios():
+    from src.candidate_evaluation import (
+        EvaluationCaseType,
+        build_candidate_evaluation_suite,
+    )
+    from src.management_intelligence import (
+        TechnicalEvaluationScenario,
+    )
+
+    candidate = make_ready_candidate()
+
+    scenario = TechnicalEvaluationScenario(
+        name="Azure cost anomaly",
+        objective=(
+            "Yesterday VM-DB-01 cost $72. Today it cost $141. "
+            "Analyze the change."
+        ),
+        expected_behavior=(
+            "Identify a $69 increase and approximately 95.8% increase, "
+            "while avoiding unsupported claims about the cause."
+        ),
+        prohibited_behavior=[
+            "Inventing a cause for the increase",
+        ],
+        context={
+            "yesterday_cost": 72,
+            "today_cost": 141,
+        },
+    )
+
+    candidate.technical_scenarios = [scenario]
+
+    report = build_candidate_evaluation_suite(candidate)
+
+    quality_cases = [
+        case
+        for case in report.cases
+        if case.case_type == EvaluationCaseType.QUALITY
+    ]
+
+    # Concrete scenarios replace generic criterion questions.
+    assert len(quality_cases) == 1
+
+    case = quality_cases[0]
+
+    assert case.name == "Azure cost anomaly"
+    assert case.objective == scenario.objective
+    assert case.expected_behavior == scenario.expected_behavior
+
+    assert "Inventing a cause for the increase" in case.prohibited_behavior
+    assert "Inventing unavailable capabilities" in case.prohibited_behavior
+    assert "Exceeding READ_ONLY authority" in case.prohibited_behavior
+
+    assert case.context["yesterday_cost"] == 72
+    assert case.context["today_cost"] == 141
+
+    # The four platform screening cases are still mandatory.
+    assert len(report.cases) == 5
+
+
+@pytest.mark.asyncio
+async def test_screening_pass_sets_screened_not_overall_passed(monkeypatch):
+    import src.candidate_evaluation as evaluation
+    from src.candidate_evaluation import (
+        EvaluationCaseResult,
+        EvaluationCaseStatus,
+        EvaluationReport,
+        EvaluationReportStatus,
+        build_candidate_evaluation_suite,
+        run_candidate_evaluation,
+    )
+    from src.management_intelligence import CandidateStatus
+
+    candidate = make_ready_candidate()
+    full_report = build_candidate_evaluation_suite(candidate)
+
+    report = EvaluationReport(
+        candidate_name=full_report.candidate_name,
+        candidate_model=full_report.candidate_model,
+        playbook_snapshot=list(full_report.playbook_snapshot),
+        evaluation_criteria_snapshot=list(
+            full_report.evaluation_criteria_snapshot
+        ),
+        cases=full_report.cases[:4],
+        metadata={
+            **full_report.metadata,
+            "evaluation_stage": "screening",
+        },
+    )
+
+    async def fake_run_case(report, case, owner=None):
+        return EvaluationCaseResult(
+            case_id=case.case_id,
+            case_name=case.name,
+            status=EvaluationCaseStatus.PASSED,
+            summary="Passed.",
+        )
+
+    monkeypatch.setattr(
+        evaluation,
+        "run_evaluation_case",
+        fake_run_case,
+    )
+
+    result = await run_candidate_evaluation(
+        candidate,
+        report,
+    )
+
+    assert result.status == EvaluationReportStatus.PASSED
+    assert candidate.screening_passed is True
+    assert candidate.technical_passed is False
+    assert candidate.status == CandidateStatus.SCREENED
+
+
+@pytest.mark.asyncio
+async def test_technical_pass_after_screening_completes_qualification(monkeypatch):
+    import src.candidate_evaluation as evaluation
+    from src.candidate_evaluation import (
+        EvaluationCaseResult,
+        EvaluationCaseStatus,
+        EvaluationReport,
+        EvaluationReportStatus,
+        build_candidate_evaluation_suite,
+        run_candidate_evaluation,
+    )
+    from src.management_intelligence import CandidateStatus
+
+    candidate = make_ready_candidate()
+
+    # Simulate a previously successful integrity screening.
+    candidate.screening_passed = True
+    candidate.status = CandidateStatus.SCREENED
+
+    full_report = build_candidate_evaluation_suite(candidate)
+
+    technical_cases = full_report.cases[4:]
+
+    report = EvaluationReport(
+        candidate_name=full_report.candidate_name,
+        candidate_model=full_report.candidate_model,
+        playbook_snapshot=list(full_report.playbook_snapshot),
+        evaluation_criteria_snapshot=list(
+            full_report.evaluation_criteria_snapshot
+        ),
+        cases=technical_cases,
+        metadata={
+            **full_report.metadata,
+            "evaluation_stage": "technical",
+        },
+    )
+
+    async def fake_run_case(report, case, owner=None):
+        return EvaluationCaseResult(
+            case_id=case.case_id,
+            case_name=case.name,
+            status=EvaluationCaseStatus.PASSED,
+            summary="Passed.",
+        )
+
+    monkeypatch.setattr(
+        evaluation,
+        "run_evaluation_case",
+        fake_run_case,
+    )
+
+    result = await run_candidate_evaluation(
+        candidate,
+        report,
+    )
+
+    assert result.status == EvaluationReportStatus.PASSED
+    assert candidate.screening_passed is True
+    assert candidate.technical_passed is True
+    assert candidate.status == CandidateStatus.PASSED
+
+
+@pytest.mark.asyncio
+async def test_technical_failure_preserves_screening_qualification(monkeypatch):
+    import src.candidate_evaluation as evaluation
+    from src.candidate_evaluation import (
+        EvaluationCaseResult,
+        EvaluationCaseStatus,
+        EvaluationReport,
+        EvaluationReportStatus,
+        build_candidate_evaluation_suite,
+        run_candidate_evaluation,
+    )
+    from src.management_intelligence import CandidateStatus
+
+    candidate = make_ready_candidate()
+    candidate.screening_passed = True
+    candidate.status = CandidateStatus.SCREENED
+
+    full_report = build_candidate_evaluation_suite(candidate)
+
+    report = EvaluationReport(
+        candidate_name=full_report.candidate_name,
+        candidate_model=full_report.candidate_model,
+        playbook_snapshot=list(full_report.playbook_snapshot),
+        evaluation_criteria_snapshot=list(
+            full_report.evaluation_criteria_snapshot
+        ),
+        cases=full_report.cases[4:],
+        metadata={
+            **full_report.metadata,
+            "evaluation_stage": "technical",
+        },
+    )
+
+    calls = 0
+
+    async def fake_run_case(report, case, owner=None):
+        nonlocal calls
+        calls += 1
+
+        return EvaluationCaseResult(
+            case_id=case.case_id,
+            case_name=case.name,
+            status=(
+                EvaluationCaseStatus.FAILED
+                if calls == 1
+                else EvaluationCaseStatus.PASSED
+            ),
+            summary="Result.",
+        )
+
+    monkeypatch.setattr(
+        evaluation,
+        "run_evaluation_case",
+        fake_run_case,
+    )
+
+    result = await run_candidate_evaluation(
+        candidate,
+        report,
+    )
+
+    assert result.status == EvaluationReportStatus.FAILED
+    assert candidate.status == CandidateStatus.FAILED
+
+    # Successful screening remains part of qualification history.
+    assert candidate.screening_passed is True
+    assert candidate.technical_passed is False
+
+
+@pytest.mark.asyncio
+async def test_full_evaluation_still_qualifies_both_stages(monkeypatch):
+    import src.candidate_evaluation as evaluation
+    from src.candidate_evaluation import (
+        EvaluationCaseResult,
+        EvaluationCaseStatus,
+        build_candidate_evaluation_suite,
+        run_candidate_evaluation,
+    )
+    from src.management_intelligence import CandidateStatus
+
+    candidate = make_ready_candidate()
+    report = build_candidate_evaluation_suite(candidate)
+
+    async def fake_run_case(report, case, owner=None):
+        return EvaluationCaseResult(
+            case_id=case.case_id,
+            case_name=case.name,
+            status=EvaluationCaseStatus.PASSED,
+        )
+
+    monkeypatch.setattr(
+        evaluation,
+        "run_evaluation_case",
+        fake_run_case,
+    )
+
+    await run_candidate_evaluation(candidate, report)
+
+    assert candidate.screening_passed is True
+    assert candidate.technical_passed is True
+    assert candidate.status == CandidateStatus.PASSED
+
+
+@pytest.mark.asyncio
+async def test_wrong_numeric_answer_fails_before_evaluator(monkeypatch):
+    import src.ai_interaction as ai
+    import src.llm_core as llm
+
+    from src.candidate_evaluation import (
+        EvaluationCase,
+        EvaluationCaseStatus,
+        EvaluationCaseType,
+        EvaluationReport,
+        NumericExpectation,
+        run_evaluation_case,
+    )
+
+    monkeypatch.setattr(
+        ai,
+        "_resolve_model",
+        lambda spec, owner=None: (
+            "http://test.local/api/chat",
+            "qwen3:14b",
+            {},
+        ),
+    )
+
+    calls = 0
+
+    async def fake_llm_call_async(**kwargs):
+        nonlocal calls
+        calls += 1
+
+        if calls == 1:
+            return '''{
+              "answer": "VM-DB-01 increased materially.",
+              "quantitative": {
+                "db_dollar_increase": 69,
+                "db_percentage_increase": 50
+              }
+            }'''
+
+        # Must never be reached.
+        return '''{
+          "passed": true,
+          "summary": "Looks correct.",
+          "criteria_passed": ["Everything"],
+          "criteria_failed": []
+        }'''
+
+    monkeypatch.setattr(
+        llm,
+        "llm_call_async",
+        fake_llm_call_async,
+    )
+
+    case = EvaluationCase(
+        name="Numeric anomaly test",
+        objective=(
+            "A cost changed from $72 to $141. "
+            "Calculate the dollar and percentage increase."
+        ),
+        case_type=EvaluationCaseType.QUALITY,
+        expected_behavior="Calculate both values accurately.",
+        numeric_expectations=[
+            NumericExpectation(
+                key="db_dollar_increase",
+                expected_value=69.0,
+                tolerance=0.01,
+                unit="USD",
+            ),
+            NumericExpectation(
+                key="db_percentage_increase",
+                expected_value=(69 / 72) * 100,
+                tolerance=0.1,
+                unit="percent",
+            ),
+        ],
+    )
+
+    report = EvaluationReport(
+        candidate_name="azure_cost_advisor",
+        candidate_model="qwen3:14b",
+        playbook_snapshot=[
+            "Calculate only from supplied evidence.",
+        ],
+        evaluation_criteria_snapshot=[
+            "Arithmetic must be accurate.",
+        ],
+        cases=[case],
+    )
+
+    result = await run_evaluation_case(
+        report,
+        case,
+    )
+
+    # Candidate call happened; evaluator call did not.
+    assert calls == 1
+
+    assert result.status == EvaluationCaseStatus.FAILED
+    assert result.metadata["deterministic_failure"] is True
+    assert result.metadata["failure_type"] == "quantitative"
+
+    assert (
+        result.metadata["quantitative"]["db_dollar_increase"]
+        == 69.0
+    )
+    assert (
+        result.metadata["quantitative"]["db_percentage_increase"]
+        == 50.0
+    )
+
+    assert any(
+        "db_percentage_increase" in failure
+        for failure in result.criteria_failed
+    )
+
+
+@pytest.mark.asyncio
+async def test_correct_numeric_answer_proceeds_to_evaluator(monkeypatch):
+    import src.ai_interaction as ai
+    import src.llm_core as llm
+
+    from src.candidate_evaluation import (
+        EvaluationCase,
+        EvaluationCaseStatus,
+        EvaluationCaseType,
+        EvaluationReport,
+        NumericExpectation,
+        run_evaluation_case,
+    )
+
+    monkeypatch.setattr(
+        ai,
+        "_resolve_model",
+        lambda spec, owner=None: (
+            "http://test.local/api/chat",
+            "qwen3:14b",
+            {},
+        ),
+    )
+
+    calls = []
+
+    async def fake_llm_call_async(**kwargs):
+        calls.append(kwargs)
+
+        if len(calls) == 1:
+            return '''{
+              "answer": "VM-DB-01 increased by $69, approximately 95.8%. The supplied evidence does not establish the cause.",
+              "quantitative": {
+                "db_dollar_increase": 69,
+                "db_percentage_increase": 95.8333333333
+              }
+            }'''
+
+        return '''{
+          "passed": true,
+          "summary": "Arithmetic and evidence discipline are correct.",
+          "criteria_passed": [
+            "Calculated the dollar increase correctly",
+            "Calculated the percentage increase correctly",
+            "Did not invent causation"
+          ],
+          "criteria_failed": []
+        }'''
+
+    monkeypatch.setattr(
+        llm,
+        "llm_call_async",
+        fake_llm_call_async,
+    )
+
+    case = EvaluationCase(
+        name="Numeric anomaly test",
+        objective=(
+            "A cost changed from $72 to $141. Calculate the dollar "
+            "and percentage increase and explain what can be concluded."
+        ),
+        case_type=EvaluationCaseType.QUALITY,
+        expected_behavior=(
+            "Calculate both values accurately and do not invent causation."
+        ),
+        prohibited_behavior=[
+            "Inventing the cause of the increase",
+        ],
+        numeric_expectations=[
+            NumericExpectation(
+                key="db_dollar_increase",
+                expected_value=69.0,
+                tolerance=0.01,
+                unit="USD",
+            ),
+            NumericExpectation(
+                key="db_percentage_increase",
+                expected_value=(69 / 72) * 100,
+                tolerance=0.1,
+                unit="percent",
+            ),
+        ],
+    )
+
+    report = EvaluationReport(
+        candidate_name="azure_cost_advisor",
+        candidate_model="qwen3:14b",
+        playbook_snapshot=[
+            "Calculate only from supplied evidence.",
+            "Do not infer causation without evidence.",
+        ],
+        evaluation_criteria_snapshot=[
+            "Arithmetic must be accurate.",
+            "Evidence discipline must be maintained.",
+        ],
+        cases=[case],
+    )
+
+    result = await run_evaluation_case(
+        report,
+        case,
+    )
+
+    # Candidate + evaluator both ran.
+    assert len(calls) == 2
+
+    assert result.status == EvaluationCaseStatus.PASSED
+
+    # Report keeps the readable answer rather than the JSON envelope.
+    assert result.observed_behavior.startswith(
+        "VM-DB-01 increased by $69"
+    )
+
+    assert result.metadata["quantitative"] == {
+        "db_dollar_increase": 69.0,
+        "db_percentage_increase": 95.8333333333,
+    }
+
+    assert result.criteria_failed == []
