@@ -25,7 +25,7 @@ import markdownModule from './js/markdown.js';
 import chatRenderer from './js/chatRenderer.js?v=20260819approvalcontrol1';
 import sessionModule from './js/sessions.js';
 import memoryModule from './js/memory.js?v=20260722memoryloading1';
-import voiceRecorderModule from './js/voiceRecorder.js';
+import voiceRecorderModule from './js/voiceRecorder.js?v=20260927voice1';
 import censorModule from './js/censor.js';
 import galleryModule from './js/gallery.js';
 import { UI_VIS_DEFAULT_OFF, resolveVisibility } from './js/ui_visibility.js';
